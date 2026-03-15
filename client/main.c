@@ -337,7 +337,6 @@ static void app_apply_autostart(void)
     if (g_app.autostart) {
         if (g_app.start_minimized) {
             app_append_token(load_line, sizeof(load_line), module_path);
-            app_append_token(load_line, sizeof(load_line), "/MIN");
         } else {
             app_append_token(run_line, sizeof(run_line), module_path);
         }
