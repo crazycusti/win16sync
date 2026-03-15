@@ -15,6 +15,8 @@
 #define PROTO_ACTION_CAPACITY 32
 #define PROTO_TEMP_NAME "SYNC.$$$"
 #define PROTO_CACHE_RECHECK_MS 300000UL
+#define PROTO_UPDATE_EXE_NAME "W16NEW.EXE"
+#define PROTO_UPDATE_INI_NAME "W16UPD.INI"
 
 typedef struct ProtoWinsockApiTag {
     HINSTANCE module;
@@ -33,6 +35,7 @@ static ProtoWinsockApi g_winsock;
 
 static void proto_copy_text(char *target, const char *source, unsigned int capacity);
 static int proto_append_text(char *target, const char *source, unsigned int capacity);
+static void proto_get_directory_path(char *path);
 static int proto_local_join(char *target, unsigned int capacity, const char *left, const char *right);
 static int proto_protocol_to_local(char *target, unsigned int capacity, const char *root_dir, const char *path);
 static int proto_build_temp_path(char *target, unsigned int capacity, const char *local_path);
@@ -52,6 +55,7 @@ static void proto_report_transfer(
 );
 static void proto_log(ProtoClient *client, const char *format, ...);
 static void proto_set_error(ProtoClient *client, const char *message);
+static void proto_set_notice(ProtoClient *client, const char *message);
 static int proto_winsock_load(ProtoClient *client);
 static void proto_winsock_unload(void);
 static int proto_connect(ProtoClient *client);
@@ -63,6 +67,7 @@ static void proto_line_kind(const char *line, char *kind, unsigned int capacity)
 static int proto_extract_param(const char *line, const char *key, char *value, unsigned int capacity);
 static unsigned long proto_extract_ulong_hex(const char *line, const char *key, unsigned long default_value);
 static unsigned long proto_extract_ulong_dec(const char *line, const char *key, unsigned long default_value);
+static int proto_compare_versions(const char *left, const char *right);
 static int proto_encode_hex(const char *source, char *target, unsigned int capacity);
 static int proto_decode_hex(const char *source, char *target, unsigned int capacity);
 static unsigned long proto_crc32_step(unsigned long crc, const unsigned char *data, unsigned int length);
@@ -114,6 +119,12 @@ static int proto_receive_download(
     unsigned long dos_stamp
 );
 static int proto_send_upload(ProtoClient *client, ProtoFileItem *item);
+static int proto_receive_update(
+    ProtoClient *client,
+    const char *server_version,
+    unsigned long expected_size,
+    unsigned long expected_crc
+);
 static void proto_summary_text(char *summary, unsigned int capacity, int actions, int conflicts, int files);
 
 static void proto_copy_text(char *target, const char *source, unsigned int capacity)
@@ -152,6 +163,22 @@ static int proto_append_text(char *target, const char *source, unsigned int capa
     }
     target[target_length + index] = '\0';
     return 1;
+}
+
+static void proto_get_directory_path(char *path)
+{
+    int index;
+
+    if (path == NULL) {
+        return;
+    }
+
+    for (index = (int)strlen(path) - 1; index >= 0; --index) {
+        if (path[index] == '\\' || path[index] == '/') {
+            path[index] = '\0';
+            return;
+        }
+    }
 }
 
 static int proto_local_join(char *target, unsigned int capacity, const char *left, const char *right)
@@ -447,6 +474,15 @@ static void proto_set_error(ProtoClient *client, const char *message)
     proto_log(client, "ERROR: %s", message);
 }
 
+static void proto_set_notice(ProtoClient *client, const char *message)
+{
+    if (client == NULL) {
+        return;
+    }
+
+    proto_copy_text(client->last_notice, message, sizeof(client->last_notice));
+}
+
 static void proto_winsock_unload(void)
 {
     if (g_winsock.module != NULL) {
@@ -499,8 +535,19 @@ void proto_client_init(ProtoClient *client)
 {
     memset(client, 0, sizeof(*client));
     proto_copy_text(client->host, "127.0.0.1", sizeof(client->host));
+    proto_copy_text(client->app_version, WIN16SYNC_APP_VERSION, sizeof(client->app_version));
     client->port = 9071;
     client->socket_handle = INVALID_SOCKET;
+}
+
+void proto_client_set_app_info(ProtoClient *client, const char *version, const char *module_path)
+{
+    if (client == NULL) {
+        return;
+    }
+
+    proto_copy_text(client->app_version, version, sizeof(client->app_version));
+    proto_copy_text(client->module_path, module_path, sizeof(client->module_path));
 }
 
 void proto_client_disconnect(ProtoClient *client)
@@ -782,6 +829,45 @@ static unsigned long proto_extract_ulong_dec(const char *line, const char *key, 
         return default_value;
     }
     return strtoul(value, NULL, 10);
+}
+
+static int proto_compare_versions(const char *left, const char *right)
+{
+    const char *left_cursor;
+    const char *right_cursor;
+
+    left_cursor = left != NULL ? left : "";
+    right_cursor = right != NULL ? right : "";
+
+    while (*left_cursor != '\0' || *right_cursor != '\0') {
+        char *left_end;
+        char *right_end;
+        unsigned long left_value;
+        unsigned long right_value;
+
+        left_value = strtoul(left_cursor, &left_end, 10);
+        right_value = strtoul(right_cursor, &right_end, 10);
+        left_cursor = left_end;
+        right_cursor = right_end;
+        if (left_value < right_value) {
+            return -1;
+        }
+        if (left_value > right_value) {
+            return 1;
+        }
+        if (*left_cursor == '.') {
+            left_cursor += 1;
+        }
+        if (*right_cursor == '.') {
+            right_cursor += 1;
+        }
+        if ((*left_cursor != '\0' && (*left_cursor < '0' || *left_cursor > '9')) ||
+            (*right_cursor != '\0' && (*right_cursor < '0' || *right_cursor > '9'))) {
+            break;
+        }
+    }
+
+    return 0;
 }
 
 static int proto_encode_hex(const char *source, char *target, unsigned int capacity)
@@ -1115,7 +1201,9 @@ static int proto_scan_recursive(
                 } else if (find_data.size <= PROTO_MAX_FILE_SIZE) {
                     if (strcmp(name_upper, PROTO_TEMP_NAME) != 0 &&
                         strcmp(name_upper, "W16SYNC.LOG") != 0 &&
-                        strcmp(name_upper, "W16SYNC.INI") != 0) {
+                        strcmp(name_upper, "W16SYNC.INI") != 0 &&
+                        strcmp(name_upper, PROTO_UPDATE_EXE_NAME) != 0 &&
+                        strcmp(name_upper, PROTO_UPDATE_INI_NAME) != 0) {
                         if (!proto_add_file_item(
                                 client,
                                 items,
@@ -1443,6 +1531,146 @@ static int proto_send_upload(ProtoClient *client, ProtoFileItem *item)
     return 1;
 }
 
+static int proto_receive_update(
+    ProtoClient *client,
+    const char *server_version,
+    unsigned long expected_size,
+    unsigned long expected_crc
+)
+{
+    char line[PROTO_LINE_CAPACITY];
+    char kind[16];
+    char module_dir[PROTO_LOCAL_PATH_CAPACITY];
+    char update_path[PROTO_LOCAL_PATH_CAPACITY];
+    char update_ini[PROTO_LOCAL_PATH_CAPACITY];
+    char command[PROTO_LINE_CAPACITY];
+    char message[PROTO_NOTICE_CAPACITY];
+    FILE *file;
+    char *buffer;
+    unsigned long actual_crc;
+    unsigned long bytes_done;
+    unsigned long last_tick;
+    unsigned long started_tick;
+    int exec_result;
+
+    if (client == NULL || client->module_path[0] == '\0') {
+        proto_set_error(client, "Updatepfad des Clients fehlt");
+        return 0;
+    }
+
+    proto_copy_text(module_dir, client->module_path, sizeof(module_dir));
+    proto_get_directory_path(module_dir);
+    if (module_dir[0] == '\0') {
+        proto_set_error(client, "Client-Verzeichnis konnte nicht bestimmt werden");
+        return 0;
+    }
+    if (!proto_local_join(update_path, sizeof(update_path), module_dir, PROTO_UPDATE_EXE_NAME) ||
+        !proto_local_join(update_ini, sizeof(update_ini), module_dir, PROTO_UPDATE_INI_NAME)) {
+        proto_set_error(client, "Updatepfad zu lang");
+        return 0;
+    }
+
+    proto_delete_local_file(update_path);
+    proto_delete_local_file(update_ini);
+    if (!proto_send_line(client, "GETUPDATE")) {
+        return 0;
+    }
+    if (!proto_read_line(client, line, sizeof(line))) {
+        return 0;
+    }
+    proto_line_kind(line, kind, sizeof(kind));
+    if (strcmp(kind, "UPDATEFILE") != 0) {
+        proto_set_error(client, "UPDATEFILE erwartet");
+        return 0;
+    }
+    if (proto_extract_ulong_dec(line, "size", 0UL) != expected_size ||
+        proto_extract_ulong_hex(line, "crc", 0UL) != expected_crc) {
+        proto_set_error(client, "Update-Metadaten stimmen nicht");
+        return 0;
+    }
+
+    file = fopen(update_path, "wb");
+    if (file == NULL) {
+        proto_set_error(client, "Update-Datei konnte nicht erstellt werden");
+        return 0;
+    }
+
+    buffer = (char *)malloc(4096U);
+    if (buffer == NULL) {
+        fclose(file);
+        proto_set_error(client, "Nicht genug Speicher fuer Update");
+        return 0;
+    }
+
+    {
+        unsigned long remaining;
+
+        remaining = expected_size;
+        bytes_done = 0UL;
+        started_tick = GetTickCount();
+        last_tick = 0UL;
+        proto_report_transfer(client, "Update", PROTO_UPDATE_EXE_NAME, 0UL, expected_size, started_tick, &last_tick);
+        while (remaining > 0UL) {
+            unsigned long chunk;
+
+            chunk = remaining > 4096UL ? 4096UL : remaining;
+            if (!proto_read_exact(client, buffer, chunk)) {
+                free(buffer);
+                fclose(file);
+                remove(update_path);
+                return 0;
+            }
+            if (fwrite(buffer, 1, (unsigned)chunk, file) != (unsigned)chunk) {
+                free(buffer);
+                fclose(file);
+                remove(update_path);
+                proto_set_error(client, "Update-Datei konnte nicht geschrieben werden");
+                return 0;
+            }
+            remaining -= chunk;
+            bytes_done = expected_size - remaining;
+            proto_report_transfer(client, "Update", PROTO_UPDATE_EXE_NAME, bytes_done, expected_size, started_tick, &last_tick);
+        }
+    }
+
+    free(buffer);
+    fclose(file);
+
+    if (!proto_file_crc32(update_path, &actual_crc) || actual_crc != expected_crc) {
+        remove(update_path);
+        proto_set_error(client, "Update-CRC stimmt nicht");
+        return 0;
+    }
+
+    if (!WritePrivateProfileString("update", "target_path", client->module_path, update_ini)) {
+        remove(update_path);
+        proto_set_error(client, "Update-Steuerdatei konnte nicht geschrieben werden");
+        return 0;
+    }
+    WritePrivateProfileString(NULL, NULL, NULL, update_ini);
+
+    wsprintf(command, "\"%s\" /SELFUPDATE", update_path);
+    exec_result = WinExec(command, SW_SHOWNORMAL);
+    if (exec_result <= 31) {
+        remove(update_ini);
+        proto_set_error(client, "Update-Helfer konnte nicht gestartet werden");
+        return 0;
+    }
+
+    if (!proto_send_line(client, "OK")) {
+        return 0;
+    }
+
+    wsprintf(
+        message,
+        "Update %s geladen, Neustart...",
+        server_version != NULL && server_version[0] != '\0' ? server_version : "neu"
+    );
+    proto_set_notice(client, message);
+    proto_log(client, "UPDATE %s size=%lu crc=%08lX", update_path, expected_size, expected_crc);
+    return 1;
+}
+
 static void proto_summary_text(char *summary, unsigned int capacity, int actions, int conflicts, int files)
 {
     if (summary == NULL || capacity == 0) {
@@ -1468,6 +1696,7 @@ int proto_sync_directory(
     char kind[16];
     char path_hex[PROTO_PATH_CAPACITY * 2];
     char path_text[PROTO_PATH_CAPACITY];
+    char server_version[PROTO_VERSION_CAPACITY];
     int index;
 
     if (summary != NULL && summary_capacity > 0U) {
@@ -1481,53 +1710,114 @@ int proto_sync_directory(
     }
     if (root_dir == NULL || root_dir[0] == '\0') {
         proto_set_error(client, "Kein Zielverzeichnis konfiguriert");
-        return 0;
+        return PROTO_SYNC_RESULT_ERROR;
     }
 
+    proto_set_notice(client, "");
     proto_log(client, "SYNC START host=%s port=%u root=%s", client->host, (unsigned int)client->port, root_dir);
-    items = (ProtoFileItem *)malloc(sizeof(ProtoFileItem) * PROTO_MAX_FILES);
-    if (items == NULL) {
-        proto_set_error(client, "Nicht genug Speicher fuer Dateiliste");
-        return 0;
-    }
-    if (!proto_scan_directory(client, root_dir, items, &item_count)) {
-        free(items);
-        return 0;
-    }
+    items = NULL;
+    item_count = 0;
     if (!proto_connect(client)) {
-        free(items);
-        return 0;
+        return PROTO_SYNC_RESULT_ERROR;
     }
 
     if (!proto_read_line(client, line, sizeof(line))) {
         proto_client_disconnect(client);
         free(items);
-        return 0;
+        return PROTO_SYNC_RESULT_ERROR;
     }
     proto_line_kind(line, kind, sizeof(kind));
     if (strcmp(kind, "HELLO") != 0) {
         proto_set_error(client, "Server-HELLO fehlt");
         proto_client_disconnect(client);
         free(items);
-        return 0;
+        return PROTO_SYNC_RESULT_ERROR;
     }
-    if (!proto_send_line(client, "HELLO proto=1 role=win16")) {
+    proto_extract_param(line, "version", server_version, sizeof(server_version));
+    wsprintf(line, "HELLO proto=1 role=win16 version=%s", client->app_version);
+    if (!proto_send_line(client, line)) {
         proto_client_disconnect(client);
         free(items);
-        return 0;
+        return PROTO_SYNC_RESULT_ERROR;
     }
 
+    if (server_version[0] != '\0' && proto_compare_versions(server_version, "0.2.0") >= 0) {
+        char update_status[16];
+        char update_version[PROTO_VERSION_CAPACITY];
+        unsigned long update_size;
+        unsigned long update_crc;
+
+        wsprintf(line, "UPDATECHECK version=%s", client->app_version);
+        if (!proto_send_line(client, line)) {
+            proto_client_disconnect(client);
+            free(items);
+            return PROTO_SYNC_RESULT_ERROR;
+        }
+        if (!proto_read_line(client, line, sizeof(line))) {
+            proto_client_disconnect(client);
+            free(items);
+            return PROTO_SYNC_RESULT_ERROR;
+        }
+        proto_line_kind(line, kind, sizeof(kind));
+        if (strcmp(kind, "UPDATE") != 0) {
+            proto_set_error(client, "UPDATE-Antwort fehlt");
+            proto_client_disconnect(client);
+            free(items);
+            return PROTO_SYNC_RESULT_ERROR;
+        }
+        proto_extract_param(line, "status", update_status, sizeof(update_status));
+        proto_extract_param(line, "version", update_version, sizeof(update_version));
+        if (strcmp(update_status, "ready") == 0) {
+            int compare_result;
+
+            update_size = proto_extract_ulong_dec(line, "size", 0UL);
+            update_crc = proto_extract_ulong_hex(line, "crc", 0UL);
+            compare_result = proto_compare_versions(update_version, client->app_version);
+            if (compare_result > 0) {
+                if (!proto_receive_update(client, update_version, update_size, update_crc)) {
+                    proto_client_disconnect(client);
+                    free(items);
+                    return PROTO_SYNC_RESULT_ERROR;
+                }
+                proto_client_disconnect(client);
+                if (summary != NULL && summary_capacity > 0U) {
+                    wsprintf(summary, "Update %s geladen, Neustart", update_version);
+                }
+                free(items);
+                return PROTO_SYNC_RESULT_UPDATE;
+            }
+            if (compare_result == 0) {
+                wsprintf(line, "Version %s ist aktuell", update_version);
+                proto_set_notice(client, line);
+            } else {
+                wsprintf(line, "Server bietet ältere Version %s", update_version);
+                proto_set_notice(client, line);
+            }
+        }
+    }
+
+    items = (ProtoFileItem *)malloc(sizeof(ProtoFileItem) * PROTO_MAX_FILES);
+    if (items == NULL) {
+        proto_set_error(client, "Nicht genug Speicher fuer Dateiliste");
+        proto_client_disconnect(client);
+        return PROTO_SYNC_RESULT_ERROR;
+    }
+    if (!proto_scan_directory(client, root_dir, items, &item_count)) {
+        proto_client_disconnect(client);
+        free(items);
+        return PROTO_SYNC_RESULT_ERROR;
+    }
     if (!proto_send_line(client, "MANIFEST")) {
         proto_client_disconnect(client);
         free(items);
-        return 0;
+        return PROTO_SYNC_RESULT_ERROR;
     }
     for (index = 0; index < item_count; ++index) {
         if (!proto_encode_hex(items[index].path, path_hex, sizeof(path_hex))) {
             proto_set_error(client, "Pfad konnte nicht codiert werden");
             proto_client_disconnect(client);
             free(items);
-            return 0;
+            return PROTO_SYNC_RESULT_ERROR;
         }
         wsprintf(
             line,
@@ -1541,13 +1831,13 @@ int proto_sync_directory(
         if (!proto_send_line(client, line)) {
             proto_client_disconnect(client);
             free(items);
-            return 0;
+            return PROTO_SYNC_RESULT_ERROR;
         }
     }
     if (!proto_send_line(client, "END")) {
         proto_client_disconnect(client);
         free(items);
-        return 0;
+        return PROTO_SYNC_RESULT_ERROR;
     }
 
     actions = 0;
@@ -1556,7 +1846,7 @@ int proto_sync_directory(
         if (!proto_read_line(client, line, sizeof(line))) {
             proto_client_disconnect(client);
             free(items);
-            return 0;
+            return PROTO_SYNC_RESULT_ERROR;
         }
         proto_line_kind(line, kind, sizeof(kind));
         if (strcmp(kind, "DONE") == 0) {
@@ -1568,20 +1858,20 @@ int proto_sync_directory(
             proto_set_error(client, "Unerwartete Server-Antwort");
             proto_client_disconnect(client);
             free(items);
-            return 0;
+            return PROTO_SYNC_RESULT_ERROR;
         }
         if (!proto_extract_param(line, "path", path_hex, sizeof(path_hex)) ||
             !proto_decode_hex(path_hex, path_text, sizeof(path_text))) {
             proto_set_error(client, "Pfad in Aktion fehlt");
             proto_client_disconnect(client);
             free(items);
-            return 0;
+            return PROTO_SYNC_RESULT_ERROR;
         }
         if (!proto_extract_param(line, "kind", kind, sizeof(kind))) {
             proto_set_error(client, "Aktionstyp fehlt");
             proto_client_disconnect(client);
             free(items);
-            return 0;
+            return PROTO_SYNC_RESULT_ERROR;
         }
 
         if (strcmp(kind, "download") == 0) {
@@ -1595,7 +1885,7 @@ int proto_sync_directory(
             if (!proto_receive_download(client, root_dir, path_text, size, crc32, dos_stamp)) {
                 proto_client_disconnect(client);
                 free(items);
-                return 0;
+                return PROTO_SYNC_RESULT_ERROR;
             }
             actions += 1;
         } else if (strcmp(kind, "upload") == 0) {
@@ -1606,18 +1896,18 @@ int proto_sync_directory(
                 proto_set_error(client, "Server verlangt unbekannte Upload-Datei");
                 proto_client_disconnect(client);
                 free(items);
-                return 0;
+                return PROTO_SYNC_RESULT_ERROR;
             }
             if (!proto_send_upload(client, &items[item_index])) {
                 proto_client_disconnect(client);
                 free(items);
-                return 0;
+                return PROTO_SYNC_RESULT_ERROR;
             }
             if (!proto_read_line(client, line, sizeof(line)) || strcmp(line, "OK") != 0) {
                 proto_set_error(client, "Upload-OK fehlt");
                 proto_client_disconnect(client);
                 free(items);
-                return 0;
+                return PROTO_SYNC_RESULT_ERROR;
             }
             actions += 1;
         } else if (strcmp(kind, "delete_local") == 0) {
@@ -1627,20 +1917,20 @@ int proto_sync_directory(
                 proto_set_error(client, "Delete-Pfad zu lang");
                 proto_client_disconnect(client);
                 free(items);
-                return 0;
+                return PROTO_SYNC_RESULT_ERROR;
             }
             if (!proto_delete_local_file(local_path)) {
                 proto_set_error(client, "Lokale Datei konnte nicht geloescht werden");
                 proto_client_disconnect(client);
                 free(items);
-                return 0;
+                return PROTO_SYNC_RESULT_ERROR;
             }
             proto_forget_cached_crc(client, path_text);
             proto_log(client, "DELETE LOCAL %s", path_text);
             if (!proto_send_line(client, "OK")) {
                 proto_client_disconnect(client);
                 free(items);
-                return 0;
+                return PROTO_SYNC_RESULT_ERROR;
             }
             actions += 1;
         } else if (strcmp(kind, "delete_remote") == 0) {
@@ -1648,7 +1938,7 @@ int proto_sync_directory(
             if (!proto_send_line(client, "OK")) {
                 proto_client_disconnect(client);
                 free(items);
-                return 0;
+                return PROTO_SYNC_RESULT_ERROR;
             }
             actions += 1;
         } else if (strcmp(kind, "conflict") == 0) {
@@ -1656,14 +1946,14 @@ int proto_sync_directory(
             if (!proto_send_line(client, "OK")) {
                 proto_client_disconnect(client);
                 free(items);
-                return 0;
+                return PROTO_SYNC_RESULT_ERROR;
             }
             conflicts += 1;
         } else {
             proto_set_error(client, "Unbekannter Aktionstyp");
             proto_client_disconnect(client);
             free(items);
-            return 0;
+            return PROTO_SYNC_RESULT_ERROR;
         }
     }
 
@@ -1677,10 +1967,15 @@ int proto_sync_directory(
         *out_conflicts = conflicts;
     }
     proto_log(client, "SYNC DONE actions=%d conflicts=%d files=%d", actions, conflicts, item_count);
-    return 1;
+    return PROTO_SYNC_RESULT_OK;
 }
 
 const char *proto_client_last_error(const ProtoClient *client)
 {
     return client != NULL ? client->last_error : "";
+}
+
+const char *proto_client_last_notice(const ProtoClient *client)
+{
+    return client != NULL ? client->last_notice : "";
 }

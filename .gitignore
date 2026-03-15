@@ -7,6 +7,9 @@
 /server/server-run.out
 /server/win16sync-server.log
 /server/win16sync-state.json
+/win16sync-server.log
+/win16sync-state.json
+/updates/
 /W16SYNC.ZIP
 /AGENTS.md
 *.tmp

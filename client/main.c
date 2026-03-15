@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <dos.h>
 #include <windows.h>
 
 #include "proto.h"
@@ -21,6 +22,11 @@
 #define APP_UNCHECKED 0
 #define APP_MIN_INTERVAL_SECONDS 1
 #define APP_MAX_INTERVAL_SECONDS 3600
+#define APP_COMMAND_CAPACITY 320
+#define APP_UPDATE_EXE_NAME "W16NEW.EXE"
+#define APP_UPDATE_INI_NAME "W16UPD.INI"
+#define APP_UPDATE_WAIT_MS 30000UL
+#define APP_UPDATE_RETRY_MS 200UL
 
 typedef struct AppStateTag {
     HINSTANCE instance;
@@ -31,6 +37,7 @@ typedef struct AppStateTag {
     int start_minimized;
     int launch_minimized;
     unsigned int sync_interval_seconds;
+    char module_path[APP_PATH_CAPACITY];
     char config_path[APP_PATH_CAPACITY];
     char log_path[APP_PATH_CAPACITY];
     char root_dir[APP_PATH_CAPACITY];
@@ -44,6 +51,7 @@ static AppState g_app;
 static void app_copy_text(char *target, const char *source, unsigned int capacity);
 static int app_get_module_path(char *path, unsigned int capacity);
 static void app_get_directory_path(char *path);
+static const char *app_path_name(const char *path);
 static int app_join_path(char *target, unsigned int capacity, const char *directory, const char *name);
 static void app_init_paths(void);
 static void app_load_config(void);
@@ -57,6 +65,11 @@ static void app_apply_autostart(void);
 static void app_apply_timer(void);
 static void app_remove_autostart_entry(char *line, unsigned int capacity, const char *exe_path);
 static void app_append_token(char *line, unsigned int capacity, const char *token);
+static int app_delete_file(const char *path);
+static void app_cleanup_update_artifacts(void);
+static int app_load_file(const char *path, void **out_data, unsigned long *out_size);
+static int app_write_file(const char *path, const void *data, unsigned long size);
+static int app_run_update_mode(void);
 static void app_run_sync(int manual);
 static void app_background(void);
 static unsigned int app_parse_interval_text(const char *text);
@@ -113,6 +126,24 @@ static void app_get_directory_path(char *path)
     }
 }
 
+static const char *app_path_name(const char *path)
+{
+    const char *name;
+    unsigned int index;
+
+    if (path == NULL || path[0] == '\0') {
+        return "";
+    }
+
+    name = path;
+    for (index = 0; path[index] != '\0'; ++index) {
+        if (path[index] == '\\' || path[index] == '/') {
+            name = path + index + 1U;
+        }
+    }
+    return name;
+}
+
 static int app_join_path(char *target, unsigned int capacity, const char *directory, const char *name)
 {
     if (target == NULL || capacity == 0 || directory == NULL || name == NULL) {
@@ -142,12 +173,16 @@ static void app_init_paths(void)
 {
     char module_path[APP_PATH_CAPACITY];
 
-    if (!app_get_module_path(module_path, sizeof(module_path))) {
+    if (!app_get_module_path(g_app.module_path, sizeof(g_app.module_path))) {
+        g_app.module_path[0] = '\0';
         GetWindowsDirectory(module_path, sizeof(module_path));
+    } else {
+        app_copy_text(module_path, g_app.module_path, sizeof(module_path));
     }
     app_get_directory_path(module_path);
     app_join_path(g_app.config_path, sizeof(g_app.config_path), module_path, "W16SYNC.INI");
     app_join_path(g_app.log_path, sizeof(g_app.log_path), module_path, "W16SYNC.LOG");
+    proto_client_set_app_info(&g_app.client, WIN16SYNC_APP_VERSION, g_app.module_path);
     proto_client_set_log_path(&g_app.client, g_app.log_path);
 }
 
@@ -346,6 +381,181 @@ static void app_apply_autostart(void)
     WriteProfileString("windows", "load", load_line);
 }
 
+static int app_delete_file(const char *path)
+{
+    unsigned attr;
+
+    if (path == NULL || path[0] == '\0') {
+        return 1;
+    }
+    if (_dos_getfileattr(path, &attr) != 0U) {
+        return 1;
+    }
+    _dos_setfileattr(path, _A_NORMAL);
+    if (remove(path) != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static void app_cleanup_update_artifacts(void)
+{
+    char module_path[APP_PATH_CAPACITY];
+    char module_dir[APP_PATH_CAPACITY];
+    char update_path[APP_PATH_CAPACITY];
+    char update_ini[APP_PATH_CAPACITY];
+
+    if (!app_get_module_path(module_path, sizeof(module_path))) {
+        return;
+    }
+    if (strcmp(app_path_name(module_path), APP_UPDATE_EXE_NAME) == 0) {
+        return;
+    }
+
+    app_copy_text(module_dir, module_path, sizeof(module_dir));
+    app_get_directory_path(module_dir);
+    if (!app_join_path(update_path, sizeof(update_path), module_dir, APP_UPDATE_EXE_NAME) ||
+        !app_join_path(update_ini, sizeof(update_ini), module_dir, APP_UPDATE_INI_NAME)) {
+        return;
+    }
+
+    app_delete_file(update_ini);
+    app_delete_file(update_path);
+}
+
+static int app_load_file(const char *path, void **out_data, unsigned long *out_size)
+{
+    FILE *file;
+    long file_size;
+    void *data;
+
+    if (out_data != NULL) {
+        *out_data = NULL;
+    }
+    if (out_size != NULL) {
+        *out_size = 0UL;
+    }
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        return 0;
+    }
+    if (fseek(file, 0L, SEEK_END) != 0) {
+        fclose(file);
+        return 0;
+    }
+    file_size = ftell(file);
+    if (file_size <= 0L || fseek(file, 0L, SEEK_SET) != 0) {
+        fclose(file);
+        return 0;
+    }
+
+    data = malloc((unsigned)file_size);
+    if (data == NULL) {
+        fclose(file);
+        return 0;
+    }
+    if (fread(data, 1, (unsigned)file_size, file) != (unsigned)file_size) {
+        free(data);
+        fclose(file);
+        return 0;
+    }
+
+    fclose(file);
+    if (out_data != NULL) {
+        *out_data = data;
+    } else {
+        free(data);
+    }
+    if (out_size != NULL) {
+        *out_size = (unsigned long)file_size;
+    }
+    return 1;
+}
+
+static int app_write_file(const char *path, const void *data, unsigned long size)
+{
+    FILE *file;
+
+    file = fopen(path, "wb");
+    if (file == NULL) {
+        return 0;
+    }
+    if (size > 0UL && fwrite(data, 1, (unsigned)size, file) != (unsigned)size) {
+        fclose(file);
+        app_delete_file(path);
+        return 0;
+    }
+    fclose(file);
+    return 1;
+}
+
+static int app_run_update_mode(void)
+{
+    char source_path[APP_PATH_CAPACITY];
+    char source_dir[APP_PATH_CAPACITY];
+    char update_ini[APP_PATH_CAPACITY];
+    char target_path[APP_PATH_CAPACITY];
+    void *data;
+    unsigned long size;
+    unsigned long started_tick;
+    unsigned long last_try_tick;
+
+    if (!app_get_module_path(source_path, sizeof(source_path))) {
+        MessageBox(0, "Updatequelle konnte nicht gefunden werden.", "Win16Sync Update", MB_OK | MB_ICONEXCLAMATION);
+        return 1;
+    }
+
+    app_copy_text(source_dir, source_path, sizeof(source_dir));
+    app_get_directory_path(source_dir);
+    if (!app_join_path(update_ini, sizeof(update_ini), source_dir, APP_UPDATE_INI_NAME)) {
+        MessageBox(0, "Update-Steuerdatei fehlt.", "Win16Sync Update", MB_OK | MB_ICONEXCLAMATION);
+        return 1;
+    }
+
+    GetPrivateProfileString("update", "target_path", "", target_path, sizeof(target_path), update_ini);
+    if (target_path[0] == '\0') {
+        MessageBox(0, "Update-Ziel fehlt.", "Win16Sync Update", MB_OK | MB_ICONEXCLAMATION);
+        return 1;
+    }
+    if (!app_load_file(source_path, &data, &size)) {
+        MessageBox(0, "Update-Datei konnte nicht geladen werden.", "Win16Sync Update", MB_OK | MB_ICONEXCLAMATION);
+        return 1;
+    }
+
+    started_tick = GetTickCount();
+    last_try_tick = 0UL;
+    while (1) {
+        unsigned long now;
+
+        now = GetTickCount();
+        if (last_try_tick == 0UL || now - last_try_tick >= APP_UPDATE_RETRY_MS) {
+            last_try_tick = now;
+            app_delete_file(target_path);
+            if (app_write_file(target_path, data, size)) {
+                break;
+            }
+        }
+        if (now - started_tick >= APP_UPDATE_WAIT_MS) {
+            free(data);
+            MessageBox(0, "Update konnte nicht installiert werden.", "Win16Sync Update", MB_OK | MB_ICONEXCLAMATION);
+            return 1;
+        }
+        Yield();
+    }
+
+    free(data);
+    app_delete_file(update_ini);
+    if (WinExec(target_path, SW_SHOWNORMAL) <= 31) {
+        MessageBox(0, "Aktualisierte Win16Sync.exe konnte nicht gestartet werden.", "Win16Sync Update", MB_OK | MB_ICONEXCLAMATION);
+        return 1;
+    }
+    return 0;
+}
+
 static void app_apply_timer(void)
 {
     if (g_app.window == 0) {
@@ -369,9 +579,16 @@ static unsigned int app_parse_interval_text(const char *text)
 
 static void app_show_info(void)
 {
+    char text[APP_STATUS_CAPACITY];
+
+    wsprintf(
+        text,
+        "Win16Sync %s\r\nWynton Grund 2026\r\nMade with Codex <3",
+        WIN16SYNC_APP_VERSION
+    );
     MessageBox(
         g_app.window,
-        "Win16Sync\r\nWynton Grund 2026\r\nMade with Codex <3",
+        text,
         "Info",
         MB_OK
     );
@@ -387,6 +604,9 @@ static void app_sync_progress(void *context, const char *status)
 static void app_run_sync(int manual)
 {
     char summary[PROTO_SUMMARY_CAPACITY];
+    char last_sync[APP_STATUS_CAPACITY];
+    int sync_result;
+    const char *notice;
 
     if (g_app.sync_running) {
         return;
@@ -402,10 +622,26 @@ static void app_run_sync(int manual)
 
     app_update_status("Synchronisiere...");
     app_update_transfer("Scanne...");
-    if (proto_sync_directory(&g_app.client, g_app.root_dir, summary, sizeof(summary), NULL, NULL)) {
+    sync_result = proto_sync_directory(&g_app.client, g_app.root_dir, summary, sizeof(summary), NULL, NULL);
+    notice = proto_client_last_notice(&g_app.client);
+    if (sync_result == PROTO_SYNC_RESULT_OK) {
         app_update_status("Verbunden");
         app_update_transfer("-");
-        app_update_last_sync(summary);
+        if (manual && notice != NULL && notice[0] != '\0' &&
+            strlen(summary) + strlen(notice) + 4U < sizeof(last_sync)) {
+            wsprintf(last_sync, "%s | %s", summary, notice);
+            app_update_last_sync(last_sync);
+        } else {
+            app_update_last_sync(summary);
+        }
+    } else if (sync_result == PROTO_SYNC_RESULT_UPDATE) {
+        app_update_status(notice != NULL && notice[0] != '\0' ? notice : "Update wird installiert");
+        app_update_transfer("-");
+        app_update_last_sync(summary[0] != '\0' ? summary : "Update geladen, Neustart");
+        g_app.sync_running = 0;
+        KillTimer(g_app.window, APP_TIMER_ID);
+        EndDialog(g_app.window, IDOK);
+        return;
     } else {
         app_update_status(proto_client_last_error(&g_app.client));
         app_update_transfer("-");
@@ -514,9 +750,13 @@ int PASCAL WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     memset(&g_app, 0, sizeof(g_app));
     g_app.instance = hInstance;
+    if (app_arg_has_switch(lpCmdLine, "/SELFUPDATE") || app_arg_has_switch(lpCmdLine, "-SELFUPDATE")) {
+        return app_run_update_mode();
+    }
     proto_client_init(&g_app.client);
-    proto_client_set_progress_callback(&g_app.client, app_sync_progress, &g_app);
     app_init_paths();
+    app_cleanup_update_artifacts();
+    proto_client_set_progress_callback(&g_app.client, app_sync_progress, &g_app);
     app_load_config();
 
     g_app.launch_minimized = app_arg_has_switch(lpCmdLine, "/MIN") || app_arg_has_switch(lpCmdLine, "-MIN") || g_app.start_minimized;

@@ -15,12 +15,15 @@ const DEFAULT_CONFIG_PATH: &str = "server-config.json";
 const LOG_TAIL_LIMIT: usize = 64;
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct Config {
     sync_bind: String,
     http_bind: String,
     root_dir: String,
     log_file: String,
     state_file: String,
+    update_file: String,
+    update_version_file: String,
 }
 
 impl Default for Config {
@@ -31,8 +34,18 @@ impl Default for Config {
             root_dir: "~/Win31Sync".to_string(),
             log_file: "win16sync-server.log".to_string(),
             state_file: "win16sync-state.json".to_string(),
+            update_file: "updates/W16SYNC.EXE".to_string(),
+            update_version_file: "updates/VERSION.TXT".to_string(),
         }
     }
+}
+
+#[derive(Clone)]
+struct UpdatePackage {
+    version: String,
+    path: PathBuf,
+    size: u64,
+    crc32: u32,
 }
 
 #[derive(Clone, Default)]
@@ -164,6 +177,18 @@ impl Shared {
 
     fn root_dir(&self) -> PathBuf {
         resolve_path(&self.config_dir(), &self.config().root_dir)
+    }
+
+    fn update_file_path(&self) -> PathBuf {
+        resolve_path(&self.config_dir(), &self.config().update_file)
+    }
+
+    fn update_version_path(&self) -> PathBuf {
+        resolve_path(&self.config_dir(), &self.config().update_version_file)
+    }
+
+    fn update_package(&self) -> io::Result<Option<UpdatePackage>> {
+        load_update_package(self)
     }
 
     fn log(&self, message: &str) {
@@ -312,8 +337,55 @@ fn handle_sync_client(shared: Arc<Shared>, stream: TcpStream, peer: &str) -> io:
         return sync_fail(&shared, "Nicht unterstützte Protokollversion");
     }
 
-    let manifest_start = read_line(&mut reader)?;
-    if manifest_start.trim() != "MANIFEST" {
+    let mut next_line = read_line(&mut reader)?;
+    let (next_command, next_values) = parse_line(&next_line);
+    if next_command == "UPDATECHECK" {
+        let client_version = next_values
+            .get("version")
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim();
+        if let Some(update) = shared.update_package()? {
+            shared.log(&format!(
+                "Update-Check von {peer}: Client={} | Angebot={}",
+                if client_version.is_empty() {
+                    "unbekannt"
+                } else {
+                    client_version
+                },
+                update.version
+            ));
+            send_line(
+                &mut writer,
+                &format!(
+                    "UPDATE status=ready version={} size={} crc={:08X}",
+                    update.version, update.size, update.crc32
+                ),
+            )?;
+        } else {
+            send_line(&mut writer, "UPDATE status=none")?;
+        }
+
+        next_line = read_line(&mut reader)?;
+        let (follow_command, _) = parse_line(&next_line);
+        if follow_command == "GETUPDATE" {
+            let update = shared
+                .update_package()?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Kein Update-Paket vorhanden"))?;
+            shared.log(&format!(
+                "Client {peer} lädt Update {} ({:08X})",
+                update.version, update.crc32
+            ));
+            send_update_file(&mut writer, &mut reader, &update)?;
+            let result = format!("Update {} an {} ausgeliefert", update.version, peer);
+            shared.set_sync_finished(&result, Vec::new());
+            shared.log(&result);
+            let _ = writer.shutdown(Shutdown::Both);
+            return Ok(());
+        }
+    }
+
+    if next_line.trim() != "MANIFEST" {
         return sync_fail(&shared, "MANIFEST erwartet");
     }
 
@@ -871,6 +943,43 @@ fn save_sync_state(shared: &Shared, state: &SyncState) -> io::Result<()> {
     write_json_file(&shared.state_path(), state)
 }
 
+fn load_update_package(shared: &Shared) -> io::Result<Option<UpdatePackage>> {
+    let version_path = shared.update_version_path();
+    let update_path = shared.update_file_path();
+    let version = match fs::read_to_string(&version_path) {
+        Ok(text) => text.trim().to_string(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    if version.is_empty() || version.chars().any(char::is_whitespace) {
+        shared.log(&format!(
+            "Update-Version ignoriert: ungültiger Inhalt in {}",
+            version_path.display()
+        ));
+        return Ok(None);
+    }
+    if !update_path.exists() {
+        return Ok(None);
+    }
+
+    let metadata = fs::metadata(&update_path)?;
+    if !metadata.is_file() || metadata.len() > MAX_FILE_SIZE {
+        shared.log(&format!(
+            "Update-Datei ignoriert: {}",
+            update_path.display()
+        ));
+        return Ok(None);
+    }
+
+    Ok(Some(UpdatePackage {
+        version,
+        size: metadata.len(),
+        crc32: crc32_file(&update_path)?,
+        path: update_path,
+    }))
+}
+
 fn write_json_file<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -942,6 +1051,7 @@ fn handle_http_client(shared: Arc<Shared>, mut stream: TcpStream) -> io::Result<
 
 fn render_index(shared: &Shared) -> String {
     let (config, runtime) = shared.snapshot();
+    let update_package = shared.update_package().ok().flatten();
     let mut body = String::new();
 
     body.push_str("<html><head><title>Win16Sync Server</title></head><body bgcolor=\"#ffffff\" text=\"#000000\">");
@@ -983,8 +1093,39 @@ fn render_index(shared: &Shared) -> String {
     body.push_str("<tr><td>State-Datei</td><td><input name=\"state_file\" size=\"40\" value=\"");
     body.push_str(&html_escape(&config.state_file));
     body.push_str("\"></td></tr>");
+    body.push_str("<tr><td>Update-EXE</td><td><input name=\"update_file\" size=\"40\" value=\"");
+    body.push_str(&html_escape(&config.update_file));
+    body.push_str("\"></td></tr>");
+    body.push_str("<tr><td>Update-Version</td><td><input name=\"update_version_file\" size=\"40\" value=\"");
+    body.push_str(&html_escape(&config.update_version_file));
+    body.push_str("\"></td></tr>");
     body.push_str("<tr><td></td><td><input type=\"submit\" value=\"Speichern\"></td></tr>");
     body.push_str("</table></form>");
+
+    body.push_str("<h2>Client-Update</h2>");
+    body.push_str("<p>Manuell bereitlegen, kein Build auf dem Server nötig.</p>");
+    body.push_str("<table border=\"1\" cellpadding=\"4\" cellspacing=\"0\">");
+    body.push_str("<tr><th align=\"left\">Status</th><td>");
+    if let Some(update) = &update_package {
+        body.push_str("Bereit");
+        body.push_str("</td></tr><tr><th align=\"left\">Version</th><td>");
+        body.push_str(&html_escape(&update.version));
+        body.push_str("</td></tr><tr><th align=\"left\">Datei</th><td>");
+        body.push_str(&html_escape(&shared.update_file_path().display().to_string()));
+        body.push_str("</td></tr><tr><th align=\"left\">Groesse</th><td>");
+        body.push_str(&html_escape(&update.size.to_string()));
+        body.push_str(" Bytes</td></tr><tr><th align=\"left\">CRC32</th><td>");
+        body.push_str(&format!("{:08X}", update.crc32));
+    } else {
+        body.push_str("Kein Update bereitgelegt");
+        body.push_str("</td></tr><tr><th align=\"left\">Erwartet</th><td>");
+        body.push_str(&html_escape(&shared.update_file_path().display().to_string()));
+        body.push_str("<br>");
+        body.push_str(&html_escape(
+            &shared.update_version_path().display().to_string(),
+        ));
+    }
+    body.push_str("</td></tr></table>");
 
     body.push_str("<h2>Konflikte</h2>");
     if runtime.conflicts.is_empty() {
@@ -1032,6 +1173,12 @@ fn save_from_form(shared: &Shared, body: &str) -> io::Result<()> {
     }
     if let Some(value) = values.get("state_file") {
         config.state_file = value.clone();
+    }
+    if let Some(value) = values.get("update_file") {
+        config.update_file = value.clone();
+    }
+    if let Some(value) = values.get("update_version_file") {
+        config.update_version_file = value.clone();
     }
 
     shared.update_config(config)?;
@@ -1147,6 +1294,24 @@ fn expect_simple_ok(reader: &mut BufReader<TcpStream>) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn send_update_file(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    update: &UpdatePackage,
+) -> io::Result<()> {
+    send_line(
+        writer,
+        &format!(
+            "UPDATEFILE version={} size={} crc={:08X}",
+            update.version, update.size, update.crc32
+        ),
+    )?;
+    let mut file = File::open(&update.path)?;
+    io::copy(&mut file, writer)?;
+    writer.flush()?;
+    expect_simple_ok(reader)
 }
 
 fn read_line(reader: &mut BufReader<TcpStream>) -> io::Result<String> {

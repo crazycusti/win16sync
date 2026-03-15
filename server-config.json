@@ -3,5 +3,7 @@
   "http_bind": "0.0.0.0:9081",
   "root_dir": "~/Win31Sync",
   "log_file": "win16sync-server.log",
-  "state_file": "win16sync-state.json"
+  "state_file": "win16sync-state.json",
+  "update_file": "updates/W16SYNC.EXE",
+  "update_version_file": "updates/VERSION.TXT"
 }
