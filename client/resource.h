@@ -1,6 +1,8 @@
 #ifndef WIN16SYNC_RESOURCE_H
 #define WIN16SYNC_RESOURCE_H
 
+#define IDI_APPICON 1
+
 #define IDD_MAIN 100
 
 #define IDC_HOST 1000

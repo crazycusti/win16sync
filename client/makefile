@@ -9,14 +9,14 @@ CFLAGS = -q -bt=windows -ml -zWs -3
 
 all: $(CLIENT_TARGET) $(SETUP_TARGET) .SYMBOLIC
 
-w16sync.res: w16sync.rc resource.h
+w16sync.res: w16sync.rc resource.h ../logo.ico
 	wrc -q -bt=windows -r w16sync.rc
 
 $(CLIENT_TARGET): $(CLIENT_OBJS) w16sync.res
 	wlink option quiet system windows name $(CLIENT_TARGET) file main.o file proto.o
 	wrc -q -bt=windows w16sync.res $(CLIENT_TARGET)
 
-setup.res: setup.rc setupres.h $(CLIENT_TARGET)
+setup.res: setup.rc setupres.h $(CLIENT_TARGET) ../logo.ico
 	wrc -q -bt=windows -r setup.rc
 
 $(SETUP_TARGET): $(SETUP_OBJS) setup.res
