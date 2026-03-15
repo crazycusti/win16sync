@@ -1,3 +1,4 @@
+use filetime::{set_file_mtime, FileTime};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -580,7 +581,9 @@ fn build_sync_actions(
                 (Some(server), None) => actions.push(SyncAction::Download { item: server.clone() }),
                 (None, Some(client)) => actions.push(SyncAction::Upload { item: client.clone() }),
                 (Some(server), Some(client)) => {
-                    if !same_live_items(Some(&server.manifest), Some(client)) {
+                    if !same_live_items(Some(&server.manifest), Some(client))
+                        && !same_without_crc_bootstrap(&server.manifest, client)
+                    {
                         actions.push(SyncAction::Conflict {
                             path: path.clone(),
                             server: Some(server.manifest.clone()),
@@ -684,7 +687,13 @@ fn build_state_after_sync(
             .get(path)
             .map(|item| item.fingerprint.clone());
 
-        if same_live_items(server_manifest.get(path).map(|item| &item.manifest), client_manifest.get(path)) && server.is_some() {
+        if (same_live_items(server_manifest.get(path).map(|item| &item.manifest), client_manifest.get(path))
+            || same_without_crc_bootstrap_option(
+                server_manifest.get(path).map(|item| &item.manifest),
+                client_manifest.get(path),
+            ))
+            && server.is_some()
+        {
             state.insert(
                 path.clone(),
                 SyncStateEntry {
@@ -814,6 +823,7 @@ fn receive_upload(
     }
 
     fs::rename(&tmp_path, &full_path)?;
+    set_file_dos_time(&full_path, dos_time)?;
     send_line(writer, "OK")?;
 
     Ok(ServerItem {
@@ -1396,6 +1406,51 @@ fn system_time_to_dos(time: SystemTime) -> u32 {
         | ((second as u32 / 2) & 0x1F)
 }
 
+fn dos_time_to_unix(dos_time: u32) -> Option<i64> {
+    let second = ((dos_time & 0x1F) as i32) * 2;
+    let minute = ((dos_time >> 5) & 0x3F) as i32;
+    let hour = ((dos_time >> 11) & 0x1F) as i32;
+    let day = ((dos_time >> 16) & 0x1F) as i32;
+    let month = ((dos_time >> 21) & 0x0F) as i32;
+    let year = (((dos_time >> 25) & 0x7F) as i32) + 1980;
+
+    if year < 1980
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    Some(days_from_civil(year, month, day) * 86_400 + (hour as i64) * 3_600 + (minute as i64) * 60 + second as i64)
+}
+
+fn days_from_civil(year: i32, month: i32, day: i32) -> i64 {
+    let year_adjusted = year - if month <= 2 { 1 } else { 0 };
+    let era = if year_adjusted >= 0 {
+        year_adjusted / 400
+    } else {
+        (year_adjusted - 399) / 400
+    };
+    let year_of_era = year_adjusted - era * 400;
+    let month_of_year = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_of_year + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    (era as i64) * 146_097 + (day_of_era as i64) - 719_468
+}
+
+fn set_file_dos_time(path: &Path, dos_time: u32) -> io::Result<()> {
+    if dos_time == 0 {
+        return Ok(());
+    }
+    if let Some(unix) = dos_time_to_unix(dos_time) {
+        set_file_mtime(path, FileTime::from_unix_time(unix, 0))?;
+    }
+    Ok(())
+}
+
 fn unix_to_ymdhms(unix: u64) -> (i32, i32, i32, i32, i32, i32) {
     let days = (unix / 86_400) as i64;
     let seconds = (unix % 86_400) as i64;
@@ -1619,6 +1674,18 @@ fn same_live_items(left: Option<&ManifestItem>, right: Option<&ManifestItem>) ->
             right.dos_time,
         ),
         (None, None) => true,
+        _ => false,
+    }
+}
+
+fn same_without_crc_bootstrap(left: &ManifestItem, right: &ManifestItem) -> bool {
+    left.fingerprint.size == right.fingerprint.size
+        && (!left.fingerprint.crc_known || !right.fingerprint.crc_known)
+}
+
+fn same_without_crc_bootstrap_option(left: Option<&ManifestItem>, right: Option<&ManifestItem>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => same_without_crc_bootstrap(left, right),
         _ => false,
     }
 }
