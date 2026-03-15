@@ -16,6 +16,7 @@
 
 #define SETUP_PATH_CAPACITY 160
 #define SETUP_STATUS_CAPACITY 160
+#define SETUP_COMMAND_CAPACITY 512
 
 typedef struct SetupStateTag {
     HINSTANCE instance;
@@ -28,6 +29,7 @@ static SetupState g_setup;
 
 static void setup_copy_text(char *target, const char *source, unsigned int capacity);
 static int setup_append_text(char *target, const char *source, unsigned int capacity);
+static int setup_append_quoted_text(char *target, const char *source, unsigned int capacity);
 static int setup_join_path(char *target, unsigned int capacity, const char *directory, const char *name);
 static void setup_default_install_dir(char *target, unsigned int capacity);
 static void setup_write_controls(HWND window);
@@ -46,6 +48,13 @@ static HDDEDATA CALLBACK setup_dde_callback(
     DWORD data2
 );
 static int setup_progman_command(const char *command);
+static int setup_build_progman_add_item(
+    char *target,
+    unsigned int capacity,
+    const char *exe_path,
+    const char *working_dir
+);
+static int setup_build_progman_add_item_simple(char *target, unsigned int capacity, const char *exe_path);
 static int setup_progman_item(const char *exe_path);
 static void setup_install(void);
 
@@ -87,6 +96,16 @@ static int setup_append_text(char *target, const char *source, unsigned int capa
     }
     target[target_length + index] = '\0';
     return 1;
+}
+
+static int setup_append_quoted_text(char *target, const char *source, unsigned int capacity)
+{
+    if (source == NULL) {
+        return 0;
+    }
+    return setup_append_text(target, "\"", capacity) &&
+        setup_append_text(target, source, capacity) &&
+        setup_append_text(target, "\"", capacity);
 }
 
 static int setup_join_path(char *target, unsigned int capacity, const char *directory, const char *name)
@@ -273,18 +292,66 @@ static int setup_progman_command(const char *command)
     return success;
 }
 
-static int setup_progman_item(const char *exe_path)
+static int setup_build_progman_add_item(
+    char *target,
+    unsigned int capacity,
+    const char *exe_path,
+    const char *working_dir
+)
 {
-    char command[SETUP_STATUS_CAPACITY];
-
-    if (!setup_progman_command("[CreateGroup(\"Win16Sync\")]") ||
-        !setup_progman_command("[ShowGroup(\"Win16Sync\",1)]") ||
-        !setup_progman_command("[ReplaceItem(\"Win16Sync\")]")) {
+    if (target == NULL || exe_path == NULL || working_dir == NULL || capacity == 0U) {
         return 0;
     }
 
-    wsprintf(command, "[AddItem(\"%s\",\"Win16Sync\")]", exe_path);
-    return setup_progman_command(command);
+    target[0] = '\0';
+    return setup_append_text(target, "[AddItem(", capacity) &&
+        setup_append_quoted_text(target, exe_path, capacity) &&
+        setup_append_text(target, ",", capacity) &&
+        setup_append_quoted_text(target, "Win16Sync", capacity) &&
+        setup_append_text(target, ",", capacity) &&
+        setup_append_quoted_text(target, exe_path, capacity) &&
+        setup_append_text(target, ",0,-1,-1,", capacity) &&
+        setup_append_quoted_text(target, working_dir, capacity) &&
+        setup_append_text(target, ")]", capacity);
+}
+
+static int setup_build_progman_add_item_simple(char *target, unsigned int capacity, const char *exe_path)
+{
+    if (target == NULL || exe_path == NULL || capacity == 0U) {
+        return 0;
+    }
+
+    target[0] = '\0';
+    return setup_append_text(target, "[AddItem(", capacity) &&
+        setup_append_quoted_text(target, exe_path, capacity) &&
+        setup_append_text(target, ",", capacity) &&
+        setup_append_quoted_text(target, "Win16Sync", capacity) &&
+        setup_append_text(target, ")]", capacity);
+}
+
+static int setup_progman_item(const char *exe_path)
+{
+    char command[SETUP_COMMAND_CAPACITY];
+    int success;
+
+    if (!setup_progman_command("[CreateGroup(\"Win16Sync\")]") ||
+        !setup_progman_command("[ShowGroup(\"Win16Sync\",1)]")) {
+        return 0;
+    }
+
+    setup_progman_command("[ReplaceItem(\"Win16Sync\")]");
+
+    if (!setup_build_progman_add_item(command, sizeof(command), exe_path, g_setup.install_dir)) {
+        return 0;
+    }
+    success = setup_progman_command(command);
+    if (!success) {
+        if (!setup_build_progman_add_item_simple(command, sizeof(command), exe_path)) {
+            return 0;
+        }
+        success = setup_progman_command(command);
+    }
+    return success;
 }
 
 static void setup_install(void)
