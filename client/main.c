@@ -583,7 +583,7 @@ static void app_show_info(void)
 
     wsprintf(
         text,
-        "Win16Sync %s\r\nWynton Grund 2026\r\nMade with Codex <3",
+        "Win16Sync\r\nVersion %s\r\nWynton Grund 2026\r\nMade with Codex <3",
         WIN16SYNC_APP_VERSION
     );
     MessageBox(
