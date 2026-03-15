@@ -9,10 +9,42 @@ prepend_path() {
   fi
 }
 
+infer_watcom_root_from_wmake() {
+  local wmake_path
+
+  wmake_path="$(command -v wmake 2>/dev/null || true)"
+  if [ -z "$wmake_path" ]; then
+    return 1
+  fi
+
+  wmake_path="$(readlink -f "$wmake_path" 2>/dev/null || printf '%s\n' "$wmake_path")"
+  case "$wmake_path" in
+    */binl64/wmake)
+      printf '%s\n' "${wmake_path%/binl64/wmake}"
+      return 0
+      ;;
+    */binl/wmake)
+      printf '%s\n' "${wmake_path%/binl/wmake}"
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
 use_watcom_root() {
+  local default_include
+
   export WATCOM="$1"
   export EDPATH="${EDPATH:-$WATCOM/eddat}"
-  export INCLUDE="${INCLUDE:-$WATCOM/h/win:$WATCOM/h:$WATCOM/lh}"
+  default_include="$WATCOM/h/win:$WATCOM/h:$WATCOM/lh"
+  case ":${INCLUDE:-}:" in
+    *":$WATCOM/h/win:"*":$WATCOM/h:"*":$WATCOM/lh:"*)
+      ;;
+    *)
+      export INCLUDE="$default_include${INCLUDE:+:$INCLUDE}"
+      ;;
+  esac
   prepend_path "$WATCOM/binl64"
   prepend_path "$WATCOM/binl"
   export PATH
@@ -69,11 +101,17 @@ if ! command -v wmake >/dev/null 2>&1; then
   fi
 fi
 
-if ! command -v wmake >/dev/null 2>&1 && [ -n "${WATCOM:-}" ]; then
+if [ -n "${WATCOM:-}" ]; then
   use_watcom_root "$WATCOM"
 fi
 
-if ! command -v wmake >/dev/null 2>&1; then
+if [ -z "${WATCOM:-}" ] && command -v wmake >/dev/null 2>&1; then
+  if INFERRED_WATCOM_ROOT="$(infer_watcom_root_from_wmake)"; then
+    use_watcom_root "$INFERRED_WATCOM_ROOT"
+  fi
+fi
+
+if [ -z "${WATCOM:-}" ]; then
   if SYSTEM_WATCOM_ROOT="$(find_system_watcom_root)"; then
     use_watcom_root "$SYSTEM_WATCOM_ROOT"
   fi
