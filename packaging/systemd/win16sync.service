@@ -1,0 +1,16 @@
+[Unit]
+Description=Win16Sync server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=win16sync
+Group=win16sync
+WorkingDirectory=/opt/win16sync
+ExecStart=/opt/win16sync/server/target/release/win16sync-server /opt/win16sync/server-config.json
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

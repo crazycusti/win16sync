@@ -1,0 +1,13 @@
+/client/*.o
+/client/*.res
+/client/*.err
+/client/*.map
+/client/*.exe
+/server/target/
+/server/server-run.out
+/server/win16sync-server.log
+/server/win16sync-state.json
+/W16SYNC.ZIP
+/AGENTS.md
+*.tmp
+*.bak

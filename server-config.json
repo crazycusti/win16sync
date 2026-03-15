@@ -1,0 +1,7 @@
+{
+  "sync_bind": "0.0.0.0:9071",
+  "http_bind": "0.0.0.0:9081",
+  "root_dir": "~/Win31Sync",
+  "log_file": "win16sync-server.log",
+  "state_file": "win16sync-state.json"
+}
