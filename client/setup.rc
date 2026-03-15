@@ -1,0 +1,19 @@
+#include <windows.h>
+#include "setupres.h"
+
+IDD_SETUP DIALOG 10, 10, 230, 126
+STYLE WS_CAPTION | WS_SYSMENU | DS_MODALFRAME
+CAPTION "Win16Sync Setup"
+FONT 8, "Helv"
+BEGIN
+    LTEXT "Win16Sync wird installiert und kann eine Programmgruppe im Program Manager anlegen.", -1, 8, 8, 214, 18
+    LTEXT "Zielordner", -1, 8, 32, 40, 10
+    EDITTEXT IDC_INSTALLDIR, 58, 30, 162, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    CONTROL "Programmgruppe in Progman anlegen", IDC_CREATEGROUP, "BUTTON", BS_AUTOCHECKBOX | WS_TABSTOP, 58, 48, 132, 10
+    CONTROL "Nach Installation starten", IDC_RUNAFTER, "BUTTON", BS_AUTOCHECKBOX | WS_TABSTOP, 58, 62, 108, 10
+    PUSHBUTTON "Installieren", IDC_INSTALLNOW, 58, 80, 50, 14
+    DEFPUSHBUTTON "Schliessen", IDCANCEL, 114, 80, 50, 14
+    LTEXT "Status: Bereit", IDC_SETUPSTATUS, 8, 102, 214, 10, SS_LEFTNOWORDWRAP
+END
+
+IDR_CLIENTBIN RCDATA DISCARDABLE "w16sync.exe"

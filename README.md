@@ -54,3 +54,8 @@ cd client
 Standard-Sync-Ordner im Client:
 
 - `C:\SYNC`
+
+Build-Artefakte:
+
+- `w16sync.exe`
+- `setup.exe`
