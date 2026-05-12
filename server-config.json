@@ -4,6 +4,7 @@
   "root_dir": "~/Win31Sync",
   "log_file": "win16sync-server.log",
   "state_file": "win16sync-state.json",
+  "scan_interval_seconds": 60,
   "update_file": "updates/W16SYNC.EXE",
   "update_version_file": "updates/VERSION.TXT"
 }

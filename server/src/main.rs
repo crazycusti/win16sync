@@ -14,6 +14,7 @@ const PROTO_VERSION: &str = "1";
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_CONFIG_PATH: &str = "server-config.json";
 const LOG_TAIL_LIMIT: usize = 64;
+const DEFAULT_SCAN_INTERVAL_SECONDS: u64 = 60;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,6 +26,7 @@ struct Config {
     state_file: String,
     update_file: String,
     update_version_file: String,
+    scan_interval_seconds: u64,
 }
 
 impl Default for Config {
@@ -37,6 +39,7 @@ impl Default for Config {
             state_file: "win16sync-state.json".to_string(),
             update_file: "updates/W16SYNC.EXE".to_string(),
             update_version_file: "updates/VERSION.TXT".to_string(),
+            scan_interval_seconds: DEFAULT_SCAN_INTERVAL_SECONDS,
         }
     }
 }
@@ -56,6 +59,10 @@ struct RuntimeState {
     last_sync_finished: String,
     last_result: String,
     last_error: String,
+    last_server_scan_started: String,
+    last_server_scan_finished: String,
+    last_server_scan_result: String,
+    last_server_scan_count: usize,
     recent_logs: VecDeque<String>,
     conflicts: Vec<ConflictRecord>,
 }
@@ -105,10 +112,18 @@ struct ConflictRecord {
 
 #[derive(Clone)]
 enum SyncAction {
-    Download { item: ServerItem },
-    Upload { item: ManifestItem },
-    DeleteLocal { path: String },
-    DeleteRemote { path: String },
+    Download {
+        item: ServerItem,
+    },
+    Upload {
+        item: ManifestItem,
+    },
+    DeleteLocal {
+        path: String,
+    },
+    DeleteRemote {
+        path: String,
+    },
     Conflict {
         path: String,
         server: Option<ManifestItem>,
@@ -125,6 +140,8 @@ struct Shared {
 struct SharedInner {
     config: Config,
     runtime: RuntimeState,
+    server_manifest: Option<BTreeMap<String, ServerItem>>,
+    server_manifest_root: Option<PathBuf>,
 }
 
 impl Shared {
@@ -144,8 +161,11 @@ impl Shared {
                 config,
                 runtime: RuntimeState {
                     last_result: "Noch kein Sync".to_string(),
+                    last_server_scan_result: "Noch kein Serverscan".to_string(),
                     ..RuntimeState::default()
                 },
+                server_manifest: None,
+                server_manifest_root: None,
             }),
             sync_guard: Mutex::new(()),
         })
@@ -233,6 +253,42 @@ impl Shared {
         inner.runtime.last_result = "Fehler".to_string();
     }
 
+    fn set_server_scan_started(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.runtime.last_server_scan_started = unix_now_string();
+    }
+
+    fn set_server_manifest(&self, root_dir: PathBuf, manifest: BTreeMap<String, ServerItem>) {
+        let count = manifest.len();
+        let mut inner = self.inner.lock().unwrap();
+        inner.server_manifest = Some(manifest);
+        inner.server_manifest_root = Some(root_dir);
+        inner.runtime.last_server_scan_finished = unix_now_string();
+        inner.runtime.last_server_scan_count = count;
+        inner.runtime.last_server_scan_result = format!("OK, {count} Dateien");
+    }
+
+    fn set_server_scan_error(&self, error: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.runtime.last_server_scan_finished = unix_now_string();
+        inner.runtime.last_server_scan_result = format!("Fehler: {error}");
+    }
+
+    fn server_manifest(&self, root_dir: &Path) -> Option<BTreeMap<String, ServerItem>> {
+        let inner = self.inner.lock().unwrap();
+        if inner.server_manifest_root.as_deref() == Some(root_dir) {
+            inner.server_manifest.clone()
+        } else {
+            None
+        }
+    }
+
+    fn replace_server_manifest(&self, root_dir: PathBuf, manifest: BTreeMap<String, ServerItem>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.server_manifest = Some(manifest);
+        inner.server_manifest_root = Some(root_dir);
+    }
+
     fn snapshot(&self) -> (Config, RuntimeState) {
         let inner = self.inner.lock().unwrap();
         (inner.config.clone(), inner.runtime.clone())
@@ -257,7 +313,9 @@ fn main() -> io::Result<()> {
 
     let sync_shared = shared.clone();
     let http_shared = shared.clone();
+    let scanner_shared = shared.clone();
 
+    thread::spawn(move || run_server_scanner(scanner_shared));
     let sync_thread = thread::spawn(move || run_sync_server(sync_shared));
     let http_thread = thread::spawn(move || run_http_server(http_shared));
 
@@ -307,6 +365,47 @@ fn run_sync_server(shared: Arc<Shared>) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_server_scanner(shared: Arc<Shared>) {
+    loop {
+        let interval = shared.config().scan_interval_seconds;
+        if interval == 0 {
+            thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+
+        if let Err(err) = refresh_server_manifest(&shared) {
+            shared.set_server_scan_error(&err.to_string());
+            shared.log(&format!("Serverscan fehlgeschlagen: {err}"));
+        }
+
+        thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+fn refresh_server_manifest(shared: &Shared) -> io::Result<()> {
+    let root_dir = shared.root_dir();
+    fs::create_dir_all(&root_dir)?;
+    shared.set_server_scan_started();
+    let manifest = scan_server_tree(shared, &root_dir)?;
+    let count = manifest.len();
+    shared.set_server_manifest(root_dir, manifest);
+    shared.log(&format!("Serverscan abgeschlossen: {count} Dateien"));
+    Ok(())
+}
+
+fn current_server_manifest(
+    shared: &Shared,
+    root_dir: &Path,
+) -> io::Result<BTreeMap<String, ServerItem>> {
+    if let Some(manifest) = shared.server_manifest(root_dir) {
+        return Ok(manifest);
+    }
+
+    let manifest = scan_server_tree(shared, root_dir)?;
+    shared.set_server_manifest(root_dir.to_path_buf(), manifest.clone());
+    Ok(manifest)
 }
 
 fn handle_sync_client(shared: Arc<Shared>, stream: TcpStream, peer: &str) -> io::Result<()> {
@@ -370,9 +469,9 @@ fn handle_sync_client(shared: Arc<Shared>, stream: TcpStream, peer: &str) -> io:
         next_line = read_line(&mut reader)?;
         let (follow_command, _) = parse_line(&next_line);
         if follow_command == "GETUPDATE" {
-            let update = shared
-                .update_package()?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Kein Update-Paket vorhanden"))?;
+            let update = shared.update_package()?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Kein Update-Paket vorhanden")
+            })?;
             shared.log(&format!(
                 "Client {peer} lädt Update {} ({:08X})",
                 update.version, update.crc32
@@ -397,7 +496,7 @@ fn handle_sync_client(shared: Arc<Shared>, stream: TcpStream, peer: &str) -> io:
     ));
 
     let mut sync_state = load_sync_state(&shared)?;
-    let mut server_manifest = scan_server_tree(&shared, &root_dir)?;
+    let mut server_manifest = current_server_manifest(&shared, &root_dir)?;
     let actions = build_sync_actions(&sync_state, &server_manifest, &client_manifest);
     let action_count = actions.len();
     let mut conflicts = Vec::new();
@@ -417,7 +516,10 @@ fn handle_sync_client(shared: Arc<Shared>, stream: TcpStream, peer: &str) -> io:
                 shared.log(&format!("Client löscht lokal: {path}"));
                 send_line(
                     &mut writer,
-                    &format!("ACTION kind=delete_local path={}", encode_hex(path.as_bytes())),
+                    &format!(
+                        "ACTION kind=delete_local path={}",
+                        encode_hex(path.as_bytes())
+                    ),
                 )?;
                 expect_simple_ok(&mut reader)?;
             }
@@ -427,11 +529,18 @@ fn handle_sync_client(shared: Arc<Shared>, stream: TcpStream, peer: &str) -> io:
                 server_manifest.remove(path);
                 send_line(
                     &mut writer,
-                    &format!("ACTION kind=delete_remote path={}", encode_hex(path.as_bytes())),
+                    &format!(
+                        "ACTION kind=delete_remote path={}",
+                        encode_hex(path.as_bytes())
+                    ),
                 )?;
                 expect_simple_ok(&mut reader)?;
             }
-            SyncAction::Conflict { path, server, client } => {
+            SyncAction::Conflict {
+                path,
+                server,
+                client,
+            } => {
                 let server_text = server
                     .as_ref()
                     .map(describe_manifest)
@@ -456,8 +565,10 @@ fn handle_sync_client(shared: Arc<Shared>, stream: TcpStream, peer: &str) -> io:
             }
         }
     }
+    shared.replace_server_manifest(root_dir.clone(), server_manifest.clone());
 
-    let final_client_manifest = apply_actions_to_client_manifest(client_manifest, &actions, &server_manifest);
+    let final_client_manifest =
+        apply_actions_to_client_manifest(client_manifest, &actions, &server_manifest);
     sync_state.files = build_state_after_sync(&server_manifest, &final_client_manifest);
     save_sync_state(&shared, &sync_state)?;
 
@@ -578,8 +689,12 @@ fn build_sync_actions(
 
         if previous.is_none() {
             match (server_item, client_item) {
-                (Some(server), None) => actions.push(SyncAction::Download { item: server.clone() }),
-                (None, Some(client)) => actions.push(SyncAction::Upload { item: client.clone() }),
+                (Some(server), None) => actions.push(SyncAction::Download {
+                    item: server.clone(),
+                }),
+                (None, Some(client)) => actions.push(SyncAction::Upload {
+                    item: client.clone(),
+                }),
                 (Some(server), Some(client)) => {
                     if !same_live_items(Some(&server.manifest), Some(client))
                         && !same_without_crc_bootstrap(&server.manifest, client)
@@ -613,11 +728,15 @@ fn build_sync_actions(
         match (server_changed, client_changed) {
             (false, false) => {}
             (true, false) => match server_item {
-                Some(server) => actions.push(SyncAction::Download { item: server.clone() }),
+                Some(server) => actions.push(SyncAction::Download {
+                    item: server.clone(),
+                }),
                 None => actions.push(SyncAction::DeleteLocal { path: path.clone() }),
             },
             (false, true) => match client_item {
-                Some(client) => actions.push(SyncAction::Upload { item: client.clone() }),
+                Some(client) => actions.push(SyncAction::Upload {
+                    item: client.clone(),
+                }),
                 None => actions.push(SyncAction::DeleteRemote { path: path.clone() }),
             },
             (true, true) => {
@@ -687,12 +806,13 @@ fn build_state_after_sync(
             .get(path)
             .map(|item| item.fingerprint.clone());
 
-        if (same_live_items(server_manifest.get(path).map(|item| &item.manifest), client_manifest.get(path))
-            || same_without_crc_bootstrap_option(
-                server_manifest.get(path).map(|item| &item.manifest),
-                client_manifest.get(path),
-            ))
-            && server.is_some()
+        if (same_live_items(
+            server_manifest.get(path).map(|item| &item.manifest),
+            client_manifest.get(path),
+        ) || same_without_crc_bootstrap_option(
+            server_manifest.get(path).map(|item| &item.manifest),
+            client_manifest.get(path),
+        )) && server.is_some()
         {
             state.insert(
                 path.clone(),
@@ -731,9 +851,7 @@ fn send_action_download(
         writer,
         &format!(
             "FILE size={} crc={:08X} dos={:08X} crc_known=1",
-            item.manifest.fingerprint.size,
-            item.manifest.fingerprint.crc32,
-            item.manifest.dos_time
+            item.manifest.fingerprint.size, item.manifest.fingerprint.crc32, item.manifest.dos_time
         ),
     )?;
 
@@ -758,26 +876,25 @@ fn receive_upload(
             encode_hex(requested.path.as_bytes()),
             requested.fingerprint.size,
             requested.fingerprint.crc32,
-            if requested.fingerprint.crc_known { 1 } else { 0 }
+            if requested.fingerprint.crc_known {
+                1
+            } else {
+                0
+            }
         ),
     )?;
 
     let header = read_line(reader)?;
     let (command, values) = parse_line(&header);
     if command != "PUT" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "PUT erwartet",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "PUT erwartet"));
     }
 
-    let path = normalize_protocol_path(
-        &decode_hex_to_string(
-            values
-                .get("path")
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Pfad fehlt"))?,
-        )?,
-    )?;
+    let path = normalize_protocol_path(&decode_hex_to_string(
+        values
+            .get("path")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Pfad fehlt"))?,
+    )?)?;
     if path != requested.path {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -900,15 +1017,15 @@ fn scan_dir_recursive(
         let metadata = entry.metadata()?;
         let size = metadata.len();
         if size > MAX_FILE_SIZE {
-            shared.log(&format!("Zu große Datei ignoriert: {}", actual_rel.display()));
+            shared.log(&format!(
+                "Zu große Datei ignoriert: {}",
+                actual_rel.display()
+            ));
             continue;
         }
 
         let crc32 = crc32_file(&entry_path)?;
-        let dos_time = metadata
-            .modified()
-            .map(system_time_to_dos)
-            .unwrap_or(0);
+        let dos_time = metadata.modified().map(system_time_to_dos).unwrap_or(0);
 
         let item = ServerItem {
             manifest: ManifestItem {
@@ -1083,6 +1200,15 @@ fn render_index(shared: &Shared) -> String {
     body.push_str("<tr><th align=\"left\">Letzter Fehler</th><td>");
     body.push_str(&html_escape(&runtime.last_error));
     body.push_str("</td></tr>");
+    body.push_str("<tr><th align=\"left\">Letzter Serverscan</th><td>");
+    body.push_str(&html_escape(&runtime.last_server_scan_finished));
+    body.push_str("</td></tr>");
+    body.push_str("<tr><th align=\"left\">Serverscan-Status</th><td>");
+    body.push_str(&html_escape(&runtime.last_server_scan_result));
+    body.push_str("</td></tr>");
+    body.push_str("<tr><th align=\"left\">Serverdateien</th><td>");
+    body.push_str(&html_escape(&runtime.last_server_scan_count.to_string()));
+    body.push_str("</td></tr>");
     body.push_str("</table>");
 
     body.push_str("<h2>Konfiguration</h2>");
@@ -1103,10 +1229,17 @@ fn render_index(shared: &Shared) -> String {
     body.push_str("<tr><td>State-Datei</td><td><input name=\"state_file\" size=\"40\" value=\"");
     body.push_str(&html_escape(&config.state_file));
     body.push_str("\"></td></tr>");
+    body.push_str(
+        "<tr><td>Serverscan (s)</td><td><input name=\"scan_interval_seconds\" size=\"10\" value=\"",
+    );
+    body.push_str(&html_escape(&config.scan_interval_seconds.to_string()));
+    body.push_str("\"> 0 = aus</td></tr>");
     body.push_str("<tr><td>Update-EXE</td><td><input name=\"update_file\" size=\"40\" value=\"");
     body.push_str(&html_escape(&config.update_file));
     body.push_str("\"></td></tr>");
-    body.push_str("<tr><td>Update-Version</td><td><input name=\"update_version_file\" size=\"40\" value=\"");
+    body.push_str(
+        "<tr><td>Update-Version</td><td><input name=\"update_version_file\" size=\"40\" value=\"",
+    );
     body.push_str(&html_escape(&config.update_version_file));
     body.push_str("\"></td></tr>");
     body.push_str("<tr><td></td><td><input type=\"submit\" value=\"Speichern\"></td></tr>");
@@ -1121,7 +1254,9 @@ fn render_index(shared: &Shared) -> String {
         body.push_str("</td></tr><tr><th align=\"left\">Version</th><td>");
         body.push_str(&html_escape(&update.version));
         body.push_str("</td></tr><tr><th align=\"left\">Datei</th><td>");
-        body.push_str(&html_escape(&shared.update_file_path().display().to_string()));
+        body.push_str(&html_escape(
+            &shared.update_file_path().display().to_string(),
+        ));
         body.push_str("</td></tr><tr><th align=\"left\">Groesse</th><td>");
         body.push_str(&html_escape(&update.size.to_string()));
         body.push_str(" Bytes</td></tr><tr><th align=\"left\">CRC32</th><td>");
@@ -1129,7 +1264,9 @@ fn render_index(shared: &Shared) -> String {
     } else {
         body.push_str("Kein Update bereitgelegt");
         body.push_str("</td></tr><tr><th align=\"left\">Erwartet</th><td>");
-        body.push_str(&html_escape(&shared.update_file_path().display().to_string()));
+        body.push_str(&html_escape(
+            &shared.update_file_path().display().to_string(),
+        ));
         body.push_str("<br>");
         body.push_str(&html_escape(
             &shared.update_version_path().display().to_string(),
@@ -1183,6 +1320,12 @@ fn save_from_form(shared: &Shared, body: &str) -> io::Result<()> {
     }
     if let Some(value) = values.get("state_file") {
         config.state_file = value.clone();
+    }
+    if let Some(value) = values.get("scan_interval_seconds") {
+        config.scan_interval_seconds = value
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_SCAN_INTERVAL_SECONDS);
     }
     if let Some(value) = values.get("update_file") {
         config.update_file = value.clone();
@@ -1248,10 +1391,9 @@ fn url_decode(text: &str) -> String {
                 index += 1;
             }
             b'%' if index + 2 < bytes.len() => {
-                if let (Some(left), Some(right)) = (
-                    hex_value(bytes[index + 1]),
-                    hex_value(bytes[index + 2]),
-                ) {
+                if let (Some(left), Some(right)) =
+                    (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+                {
                     out.push((left * 16 + right) as char);
                     index += 3;
                 } else {
@@ -1424,7 +1566,12 @@ fn dos_time_to_unix(dos_time: u32) -> Option<i64> {
         return None;
     }
 
-    Some(days_from_civil(year, month, day) * 86_400 + (hour as i64) * 3_600 + (minute as i64) * 60 + second as i64)
+    Some(
+        days_from_civil(year, month, day) * 86_400
+            + (hour as i64) * 3_600
+            + (minute as i64) * 60
+            + second as i64,
+    )
 }
 
 fn days_from_civil(year: i32, month: i32, day: i32) -> i64 {
@@ -1469,14 +1616,7 @@ fn unix_to_ymdhms(unix: u64) -> (i32, i32, i32, i32, i32, i32) {
     let month = mp + if mp < 10 { 3 } else { -9 };
     let year = y + if month <= 2 { 1 } else { 0 };
 
-    (
-        year as i32,
-        month as i32,
-        day as i32,
-        hour,
-        minute,
-        second,
-    )
+    (year as i32, month as i32, day as i32, hour, minute, second)
 }
 
 fn normalize_protocol_path(path: &str) -> io::Result<String> {
@@ -1605,9 +1745,15 @@ fn html_escape(text: &str) -> String {
 
 fn describe_manifest(item: &ManifestItem) -> String {
     if item.fingerprint.crc_known {
-        format!("size={} crc={:08X}", item.fingerprint.size, item.fingerprint.crc32)
+        format!(
+            "size={} crc={:08X}",
+            item.fingerprint.size, item.fingerprint.crc32
+        )
     } else {
-        format!("size={} crc=OFF dos={:08X}", item.fingerprint.size, item.dos_time)
+        format!(
+            "size={} crc=OFF dos={:08X}",
+            item.fingerprint.size, item.dos_time
+        )
     }
 }
 
@@ -1683,7 +1829,10 @@ fn same_without_crc_bootstrap(left: &ManifestItem, right: &ManifestItem) -> bool
         && (!left.fingerprint.crc_known || !right.fingerprint.crc_known)
 }
 
-fn same_without_crc_bootstrap_option(left: Option<&ManifestItem>, right: Option<&ManifestItem>) -> bool {
+fn same_without_crc_bootstrap_option(
+    left: Option<&ManifestItem>,
+    right: Option<&ManifestItem>,
+) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => same_without_crc_bootstrap(left, right),
         _ => false,
